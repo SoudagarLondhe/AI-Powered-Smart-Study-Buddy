@@ -5,7 +5,10 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from apis.auth_api import SignUpAPI, LoginAPI
+from apis.auth_api import SignUpAPI, LoginAPI, GenerateQuizAPI
+# from apis.gpt_api import SummarizeAPI
+
+from apis.gpt_api import router as gpt_router
 from models import init_models  # uses metadata only (no DB setup here)
 
 # --- DB connection lives ONLY here ---
@@ -23,10 +26,16 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 init_models(engine)
 
 # --- FastAPI + URL mappings ---
-app = FastAPI(title="Auth APIs")
+app = FastAPI(title="APIs")
 
 app.add_api_route("/auth/signup", SignUpAPI(SessionLocal), methods=["POST"])
 app.add_api_route("/auth/login",  LoginAPI(SessionLocal),  methods=["POST"])
+app.add_api_route("/auth/generate/quiz", GenerateQuizAPI(SessionLocal), methods=["POST","DELETE"])
+
+
+# app.add_api_route("/ai/summarize", SummarizeAPI(), methods=["POST"])
+
+app.include_router(gpt_router)
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
