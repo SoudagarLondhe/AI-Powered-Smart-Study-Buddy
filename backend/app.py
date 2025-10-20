@@ -1,3 +1,4 @@
+# backend/app.py
 import os
 import uvicorn
 from fastapi import FastAPI
@@ -5,11 +6,16 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from apis.auth_api import SignUpAPI, LoginAPI, GenerateQuizAPI
-# from apis.gpt_api import SummarizeAPI
+from apis.auth_api import SignUpAPI, LoginAPI
+from models import init_models  # from models/db_model.py
 
-from apis.gpt_api import router as gpt_router
-from models import init_models  # uses metadata only (no DB setup here)
+# Import ONLY the functions (no router) from gpt_api
+from apis.gpt_api import (
+    set_session_factory,
+    ingest_and_store_endpoint,
+    list_courses,
+    get_course,
+)
 
 # --- DB connection lives ONLY here ---
 load_dotenv()  # reads .env at project root
@@ -28,14 +34,17 @@ init_models(engine)
 # --- FastAPI + URL mappings ---
 app = FastAPI(title="APIs")
 
+# Auth routes (class-callables)
 app.add_api_route("/auth/signup", SignUpAPI(SessionLocal), methods=["POST"])
 app.add_api_route("/auth/login",  LoginAPI(SessionLocal),  methods=["POST"])
-app.add_api_route("/auth/generate/quiz", GenerateQuizAPI(SessionLocal), methods=["POST","DELETE"])
 
+# Provide DB session to content ingestion/fetch functions
+set_session_factory(SessionLocal)
 
-# app.add_api_route("/ai/summarize", SummarizeAPI(), methods=["POST"])
-
-app.include_router(gpt_router)
+# Content ingestion + read routes (function-callables)
+app.add_api_route("/addcourse", ingest_and_store_endpoint, methods=["POST"])
+app.add_api_route("/courses",      list_courses,              methods=["GET"])
+app.add_api_route("/courses/{course_id}", get_course,         methods=["GET"])
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
