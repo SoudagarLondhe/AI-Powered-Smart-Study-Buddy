@@ -7,7 +7,7 @@ from typing import Callable, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import HTTPException, UploadFile, File, Form, Body
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 
 # File parsers
@@ -15,32 +15,30 @@ import pdfplumber
 from docx import Document as DocxDocument
 from pptx import Presentation
 
-# DB model (single models file)
-from models import Course
+# DB models
+from models import Course, Summary
+from fastapi import Query
+
+# OpenAI for AI-powered summarization
+from openai import OpenAI
 
 load_dotenv()
 
-# ---------------- session factory wiring ----------------
+# --- Global session factory ---
 _SESSION_FACTORY: Optional[Callable[[], Session]] = None
-
 def set_session_factory(factory: Callable[[], Session]) -> None:
-    """
-    Call this once in app.py after you build SessionLocal:
-        from apis.gpt_api import set_session_factory
-        set_session_factory(SessionLocal)
-    """
     global _SESSION_FACTORY
     _SESSION_FACTORY = factory
 
-# ---------------- response helpers ----------------
+# --- Helper responses ---
 def _fail(msg: str) -> dict:
     return {"status": "FAIL", "statusCode": 200, "message": msg, "data": ""}
 
 def _success(data_str: str, message: str = "") -> dict:
     return {"status": "SUCCESS", "statusCode": 200, "message": message, "data": data_str}
 
-# ---------------- extraction helpers ----------------
-MAX_BYTES = 50 * 1024 * 1024  # 50 MB per file
+# --- File extraction helpers ---
+MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 
 def _read_pdf(path: str) -> str:
     parts: List[str] = []
@@ -66,7 +64,6 @@ def _extract_text_from_upload(upload: UploadFile) -> str:
     name = upload.filename or "uploaded"
     _, ext = os.path.splitext(name.lower())
 
-    # quick size check
     upload.file.seek(0, os.SEEK_END)
     size = upload.file.tell()
     upload.file.seek(0)
@@ -97,7 +94,6 @@ def _extract_text_from_upload(upload: UploadFile) -> str:
     return text
 
 def _extract_many(uploads: List[UploadFile]) -> List[tuple[str, str]]:
-    """Returns list of (stem, text) where stem is filename without extension."""
     out: List[tuple[str, str]] = []
     for up in uploads:
         text = _extract_text_from_upload(up)
@@ -106,52 +102,35 @@ def _extract_many(uploads: List[UploadFile]) -> List[tuple[str, str]]:
     return out
 
 def _derive_course_name(stems: List[str], override: Optional[str]) -> str:
-    """Pick a readable course name for a bundle if client didn't pass one."""
     if override:
         return override[:255]
     if not stems:
         return "Untitled"
-    # Join up to first 3 names; if more, indicate the count.
     base = " & ".join(stems[:3])
     if len(stems) > 3:
         base += f" (+{len(stems)-3} more)"
     return base[:255]
 
-# ---------------- POST: /addcourse (upload & store ONLY) ----------------
+# --- POST /addcourse ---
 def ingest_and_store_endpoint(
-    # Single consistent key for one-or-many files
     files: Optional[List[UploadFile]] = File(default=None),
     course_name: Optional[str] = Form(default=None),
-    # JSON fallback (optional raw text ingestion)
     body: Optional[dict] = Body(default=None),
 ):
-    """
-    POST /addcourse   (route defined in app.py)
-    Behavior:
-      - If 'files' contains 1 file: extract text and save ONE course row.
-      - If 'files' contains N>1 files: extract each, CONCATENATE them, and save ONE course row.
-        The course_name is either provided via form field or derived from filenames.
-      - JSON fallback (no files): { "course_name": "...", "content": "..." } saves ONE row.
-    """
     if _SESSION_FACTORY is None:
         return _fail("Server misconfigured: no DB session factory is set.")
 
     try:
         if files is not None and len(files) > 0:
-            extracted = _extract_many(files)  # list of (stem, text)
+            extracted = _extract_many(files)
             stems = [s for s, _ in extracted]
-
-            # Build a single combined content block with clear separators
-            parts = []
-            for stem, text in extracted:
-                parts.append(f"=== FILE: {stem} ===\n{text}")
-            combined_content = "\n\n".join(parts).strip()
-
+            combined_content = "\n\n".join(
+                [f"=== FILE: {s} ===\n{t}" for s, t in extracted]
+            ).strip()
             if not combined_content:
                 return _fail("No readable text found in uploaded files.")
 
             final_name = _derive_course_name(stems, course_name)
-
             with _SESSION_FACTORY() as db:
                 row = Course(course_name=final_name, course_content=combined_content)
                 db.add(row)
@@ -160,8 +139,8 @@ def ingest_and_store_endpoint(
                 db.commit()
 
             return _success(
-                data_str=f"Saved 1 course(s): {final_name}=>id={new_id}",
-                message="Stored concatenated text from uploaded files into a single course."
+                f"Saved 1 course(s): {final_name}=>id={new_id}",
+                "Stored concatenated text from uploaded files into a single course."
             )
 
         elif body and isinstance(body, dict) and body.get("content"):
@@ -178,8 +157,8 @@ def ingest_and_store_endpoint(
                 db.commit()
 
             return _success(
-                data_str=f"Saved 1 course(s): {cname}=>id={new_id}",
-                message="Stored raw text into courses table."
+                f"Saved 1 course(s): {cname}=>id={new_id}",
+                "Stored raw text into courses table."
             )
 
         else:
@@ -190,17 +169,8 @@ def ingest_and_store_endpoint(
     except Exception as e:
         return _fail(f"Ingestion failed: {type(e).__name__}")
 
-# ---------------- GET: /courses (list) ----------------
-def list_courses(
-    limit: int = 25,
-    offset: int = 0,
-    q: Optional[str] = None,
-):
-    """
-    GET /courses   (route defined in app.py)
-    Lists saved rows with basic pagination and optional name search.
-    'data' is a JSON string.
-    """
+# --- GET /courses ---
+def list_courses(limit: int = 25, offset: int = 0, q: Optional[str] = None):
     if _SESSION_FACTORY is None:
         return _fail("Server misconfigured: no DB session factory is set.")
 
@@ -209,51 +179,135 @@ def list_courses(
             Course.course_id,
             Course.course_name,
             func.length(Course.course_content).label("content_len"),
-            Course.created_at,
         )
         if q:
-            stmt = stmt.where(func.lower(Course.course_name).like(f"%{q.lower()}%"))
+            from sqlalchemy import func as _func
+            stmt = stmt.where(_func.lower(Course.course_name).like(f"%{q.lower()}%"))
         stmt = stmt.order_by(Course.course_id.desc()).offset(offset).limit(limit)
 
         rows = db.execute(stmt).all()
         payload = [
-            {
-                "course_id": r.course_id,
-                "course_name": r.course_name,
-                "content_len": int(r.content_len or 0),
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
+            {"course_id": r.course_id, "course_name": r.course_name, "content_len": int(r.content_len or 0)}
             for r in rows
         ]
-        return _success(
-            data_str=json.dumps(payload, ensure_ascii=False),
-            message=f"Fetched {len(payload)} course(s).",
-        )
+        return _success(json.dumps(payload, ensure_ascii=False), message=f"Fetched {len(payload)} course(s).")
 
-# ---------------- GET: /courses/{course_id} (detail) ----------------
+# --- GET /courses/{course_id} ---
 def get_course(course_id: int):
-    """
-    GET /courses/{course_id}   (route defined in app.py)
-    Returns one row with full content. 'data' is a JSON string.
-    """
     if _SESSION_FACTORY is None:
         return _fail("Server misconfigured: no DB session factory is set.")
 
     with _SESSION_FACTORY() as db:
         row = db.execute(
-            select(Course).where(Course.course_id == course_id)
-        ).scalar_one_or_none()
+            select(Course.course_id, Course.course_name, Course.course_content)
+            .where(Course.course_id == course_id)
+        ).one_or_none()
 
         if not row:
             return _fail(f"Course id={course_id} not found")
 
+        course_id_db, course_name_db, content = row
         payload = {
-            "course_id": row.course_id,
-            "course_name": row.course_name,
-            "course_content": row.course_content,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "course_id": course_id_db,
+            "course_name": course_name_db,
+            "course_content": content,
+        }
+        return _success(json.dumps(payload, ensure_ascii=False), message=f"Fetched course id={course_id}.")
+
+# --- POST /courses/{course_id}/summary ---
+def generate_course_summary(course_id: int, body: dict = Body(...)):
+    """
+    Generate or replace a summary for a given course_id and length: short|medium|long
+    """
+    if _SESSION_FACTORY is None:
+        return _fail("Server misconfigured: no DB session factory is set.")
+
+    summary_length = body.get("summary_length")
+    summary_map = {"short": 300, "medium": 700, "long": 1200}
+    max_chars = summary_map.get(summary_length.lower())
+    if not max_chars:
+        return _fail("Invalid summary_length. Use one of: short, medium, long.")
+
+    with _SESSION_FACTORY() as db:
+        row = db.execute(
+            select(Course.course_id, Course.course_name, Course.course_content)
+            .where(Course.course_id == course_id)
+        ).one_or_none()
+        if not row:
+            return _fail(f"Course id={course_id} not found")
+
+        _, cname, content = row
+        content = (content or "").strip()
+        if not content:
+            return _fail(f"Course id={course_id} has no content")
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    system_prompt = (
+        f"You are a helpful teaching assistant. Summarize the following course material in {summary_length} form. "
+        "Explain concepts in very simple, clear language that any student can understand. "
+        "Avoid jargon. Use bullet points and short sentences."
+    )
+
+    user_prompt = f"Summarize this course content:\n\n{content[:4000]}"
+
+    try:
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=f"{system_prompt}\n\n{user_prompt}",
+            max_output_tokens=max_chars,
+        )
+        summary_text = getattr(resp, "output_text", None) or str(resp)
+    except Exception as e:
+        return _fail(f"AI summarization failed: {type(e).__name__}")
+
+    with _SESSION_FACTORY() as db:
+        db.execute(
+            delete(Summary).where(Summary.course_id == course_id, Summary.summary_length == summary_length)
+        )
+        db.add(Summary(course_id=course_id, summary_length=summary_length, summary_content=summary_text))
+        db.commit()
+
+    return _success(
+        summary_text,
+        message=f"Summary ({summary_length}) generated and stored for course_id={course_id}."
+    )
+
+
+def get_course_summary(
+    course_id: int,
+    summary_length: str = Query(..., description="short | medium | long"),
+):
+    """
+    GET /courses/{course_id}/summary?summary_length=short|medium|long
+    Returns the stored summary for (course_id, summary_length).
+    """
+    if _SESSION_FACTORY is None:
+        return _fail("Server misconfigured: no DB session factory is set.")
+
+    length = (summary_length or "").strip().lower()
+    if length not in {"short", "medium", "long"}:
+        return _fail("Invalid summary_length. Use one of: short, medium, long.")
+
+    with _SESSION_FACTORY() as db:
+        row = db.execute(
+            select(Summary.summary_id, Summary.summary_content)
+            .where(Summary.course_id == course_id, Summary.summary_length == length)
+        ).one_or_none()
+
+        if not row:
+            return _fail(
+                f"No summary found for course_id={course_id} and length='{length}'. "
+                f"POST /courses/{course_id}/summary to generate one."
+            )
+
+        summary_id, summary_content = row
+        payload = {
+            "summary_id": summary_id,
+            "course_id": course_id,
+            "summary_length": length,
+            "summary_content": summary_content,
         }
         return _success(
             data_str=json.dumps(payload, ensure_ascii=False),
-            message=f"Fetched course id={course_id}.",
+            message=f"Fetched summary for course_id={course_id}, length={length}."
         )

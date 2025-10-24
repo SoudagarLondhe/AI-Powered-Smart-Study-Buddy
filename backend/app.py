@@ -15,6 +15,14 @@ from apis.gpt_api import (
     ingest_and_store_endpoint,
     list_courses,
     get_course,
+    generate_course_summary,
+    get_course_summary, 
+)
+
+from apis.flashcards_api import (
+    set_session_factory_for_flashcards,
+    create_or_replace_flashcards,
+    get_flashcards,
 )
 
 # --- DB connection lives ONLY here ---
@@ -40,11 +48,17 @@ app.add_api_route("/auth/login",  LoginAPI(SessionLocal),  methods=["POST"])
 
 # Provide DB session to content ingestion/fetch functions
 set_session_factory(SessionLocal)
+set_session_factory_for_flashcards(SessionLocal)
 
 # Content ingestion + read routes (function-callables)
 app.add_api_route("/addcourse", ingest_and_store_endpoint, methods=["POST"])
 app.add_api_route("/courses",      list_courses,              methods=["GET"])
 app.add_api_route("/courses/{course_id}", get_course,         methods=["GET"])
+app.add_api_route("/courses/{course_id}/summary", generate_course_summary, methods=["POST"])
+app.add_api_route("/courses/{course_id}/summary", get_course_summary,      methods=["GET"])
+
+app.add_api_route("/courses/{course_id}/flashcards", create_or_replace_flashcards, methods=["POST"])
+app.add_api_route("/courses/{course_id}/flashcards", get_flashcards,              methods=["GET"])
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
